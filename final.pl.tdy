@@ -1,0 +1,255 @@
+use strict;
+use HTTP::Request;
+use LWP::UserAgent;
+use Data::Dumper;
+use List::MoreUtils qw(uniq);
+
+#use XML::XPath::XMLParser;
+#use XML::Xpath;
+use HTML::TreeBuilder::XPath;
+use DBI;
+my @links;
+my $table_name    = "result";
+my $database_name = "links";
+my $ip_address    = "192.168.1.101";
+my $user          = "alex";
+my $password      = "alex";
+
+my $dbh =
+  DBI->connect( "DBI:mysql:$database_name:$ip_address", $user, $password )
+  or die("Couldn't connect");
+my $database = $dbh->prepare("create database if not exists  $database_name ");
+$database->execute;
+my $sth = $dbh->prepare(
+"create table if not exists  $table_name (id  MEDIUMINT NOT NULL AUTO_INCREMENT, date timestamp default current_timestamp ,  name varchar(80)  , price varchar(132) , price_label varchar(80) ,PRIMARY KEY(id) )"
+);
+$sth->execute;
+my $url = "https://global.ihs.com";
+
+sub check_link_list {
+    my $url = shift;
+    my $i   = 21;
+
+    #extract_all_prices($url);
+    if ( $url =~ /.cfm\?$/ || $url =~ /input_search_filter/ ) {
+        my $result;
+
+        $result = extract_all_prices($url);
+        do {
+
+            if ( $result eq "Empty" ) {
+                return 0;
+            }
+            else {
+                my $new_url;
+                if($url =~ /input_search_filter/)
+                {
+                        my $publisher = (split(/=/))[1];
+                        $i=$i+20;
+                        $new_url=$url."&input_doc_number=&input_doc_title=&org_code=$publisher&show_all=Y&eqid=21863145&sort=DOC_NUM-asc&start_row=".$i;
+                }
+                else
+                {
+		  $i=$i+20;
+                  $new_url=$url."start_row=$i";
+                 }
+                 print "My new url".$new_url."\n";
+                 $result=extract_all_prices($new_url);
+                 
+                return 0 if ( $i == 3000 );
+            }
+        } while ( $result ne "Empty" );
+    }
+    else {
+        extract_all_prices($url);
+    }
+}
+
+# it is working
+eval {
+
+    my $lwp = LWP::UserAgent->new;
+    sleep(5);
+    my $request     = HTTP::Request->new( GET => $url );
+    my $response    = $lwp->request($request);
+    my @links_array = ( $response->content =~ m/href=\"(.*?)\"/g );
+    for (@links_array) {
+
+        if ( $_ =~ /terms.cfm$/ || $_ =~ /contact_us.cfm/ || $_ =~ /help.cfm/ )
+        {
+
+            next;
+        }
+        elsif ( $_ =~ /publisher/ ) {
+            my $publisher = ( split(/=/) )[1];
+            my $url =
+"https://global.ihs.com/search_res.cfm?&input_search_filter=$publisher";
+            push( @links, $url );
+        }
+        elsif ( $_ =~ /http/ && $_ =~ /global/ ) {
+            $_ =~ s/\s/%20/g;
+            push( @links, $_ );
+
+        }
+
+    }
+
+};
+if ($@) {
+    print "Problem=" . $@;
+
+}
+
+print Dumper @links;
+
+#exit(2);
+
+sub extract_all_prices {
+    my $url      = shift;
+    my $lwp      = LWP::UserAgent->new;
+    my $request  = HTTP::Request->new( GET => $url );
+    my $response = $lwp->request($request);
+
+    my $tree = HTML::TreeBuilder::XPath->new_from_content( $response->content );
+
+    my @nodes = $tree->findnodes('//div[@class="search-result-row"]');
+    if ( !@nodes ) {
+        print "Empty nodes\n";
+
+        my @prices = $tree->findnodes('//span[@class="document_detail_price"]');
+        my @doc_name = $tree->findnodes('//span[@class="doc_detail_name"]');
+        return "Empty" if ( !$doc_name[0] );
+        print "Test=" . $doc_name[0]->as_text();
+        my @doc_labels =
+          $tree->findnodes('//div[@class="document_detail_type"]');
+        my $i = 0;
+        for my $doc_label (@doc_labels) {
+            my $price;
+            if ( !defined( $prices[$i] ) ) {
+                $price = "";
+            }
+            else {
+                $price = $prices[$i]->as_text();
+            }
+
+            my $sth = $dbh->prepare(
+"select * from $table_name where name=? and price=? and price_label=?"
+            );
+            $sth->execute( $doc_name[0]->as_text(),
+                $price, $doc_label->as_text() );
+            my @row = $sth->fetchrow_array;
+            if (@row) {
+                print "GOOD catch\n";
+                last;
+            }
+            $sth = $dbh->prepare(
+"insert into $table_name (name, price , price_label ) values(?,?,?)"
+            );
+            $sth->execute( $doc_name[0]->as_text(),
+                $price, $doc_label->as_text() );
+            $i++;
+        }
+
+        return 0;
+    }
+    my $j = 0;
+    for my $node (@nodes) {
+
+        my @price_label_nodes = $node->findnodes('//div[@class="price_label"]');
+        my @document_price_nodes =
+          $node->findnodes('//span[@class="document_price_value"]');
+        my @document_name_nodes =
+          $node->findnodes('//a[@class="document-name"]');
+        my $product_name = $document_name_nodes[$j]->as_text();
+
+        my $i = 0;
+        for my $price_label (@price_label_nodes) {
+
+            my $price;
+            if ( !defined( $document_price_nodes[$i] ) ) {
+                $price = "";
+            }
+            else {
+                $price = $document_price_nodes[$i]->as_text();
+            }
+
+            my $sth = $dbh->prepare(
+"select * from $table_name where name=? and price=? and price_label=?"
+            );
+            $sth->execute( $product_name, $price, $price_label->as_text() );
+            my @row = $sth->fetchrow_array;
+            if (@row) {
+                print "GOOD catch\n";
+                last;
+            }
+            $sth = $dbh->prepare(
+"insert into $table_name (name, price , price_label ) values(?,?,?)"
+            );
+
+            print "zzzzz=" . $product_name;
+
+            $sth->execute( $product_name, $price, $price_label->as_text() );
+            $i++;
+        }
+
+        $j++;
+    }
+
+  #my @price_label_node=$nodes[0]->findnodes('//div[@class="price_label"]');
+  #print $price_label_node[0]->as_text();
+  #my $html =HTML::TreeBuilder::XPath->new();
+  #$html->parse($nodes[0]->as_HTML);
+  #print Dumper $html->findvalues('//span[@class="document_price_value"]')."\n";
+
+=cut
+for my $result ($tree->findnodes('//div[@class="search-result-row"]'))
+{
+      my $x = HTML::TreeBuilder::XPath->new;
+      $x->parse($result->as_HTML);
+   print "Node==".$x->findvalues('//div[@class="price_label"]')."\n";
+}
+=cut
+
+    #print $container->findvalues('//span[@class="document_price_value"]');
+
+=cut
+my @data=$tree->findvalues('//span[@class="document_price_value"]');
+print Dumper @data;
+=cut
+
+=cut
+my @lables=$tree->findvalues('//div[@class="price_label"]');
+print Dumper @lables;
+=cut
+
+    #$tree->parse($response->content);
+
+=cut
+my @document_names=$tree->findvalues('//a[@class="document-name"]');
+print Dumper @document_names;
+=cut
+
+=cut
+my @document_names=($response->content =~ m/document_name=(.*?)&stage/g);
+#print Dumper @document_names;
+
+for(@document_names)
+{
+my $sth=$dbh->prepare("insert into $table_name (name) values(?)" );
+$sth->execute($_);
+}
+=cut
+
+}
+
+#extract_all_prices("https://global.ihs.com/doc_detail.cfm?&document_name=ASME%20NQA-1&item_s_key=00011834");
+
+for (@links) {
+    print "Links=" . $_ . "\n";
+    check_link_list($_);
+    sleep(2);
+
+}
+
+#extract_all_prices("https://global.ihs.com/the_9000_store.cfm?");
+#extract_all_prices("https://global.ihs.com/doc_detail.cfm?&item_s_key=00618202&item_key_date=901229");
